@@ -1,1 +1,1 @@
-worker: python telegram_bot.py
+web: gunicorn -w 1 -b 0.0.0.0:$PORT telegram_bot:app
