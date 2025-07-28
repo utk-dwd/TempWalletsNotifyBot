@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 # Replace with your actual bot token obtained from BotFather
 # Example: '123456:ABC-DEF1234ghIkl-zyx57W23u1PoQnOR'
-TOKEN = "7173660283:AAHQkgoELkNwrVkBmZrD6UkMYYsHLQYqRgw" 
+TOKEN = TELEGRAM_BOT_TOKEN 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the command /start is issued."""
