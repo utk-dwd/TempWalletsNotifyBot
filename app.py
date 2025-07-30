@@ -1,11 +1,9 @@
 import logging
 import os
-from telegram import Update
+import asyncio
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, request, jsonify
-import asyncio
-import threading
-from functools import wraps
 
 # Configure logging
 logging.basicConfig(
@@ -17,83 +15,19 @@ logger = logging.getLogger(__name__)
 # --- Environment Variables ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN environment variable not set. The bot will not function.")
+    logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is missing.")
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-if not WEBHOOK_URL:
-    logger.warning("WEBHOOK_URL environment variable not set. Webhook will not be set automatically.")
-    logger.warning("You will need to manually set the webhook using Telegram Bot API if deploying.")
 
 # Initialize Flask app
 app = Flask(__name__)
 
-# Global variables for bot application and event loop
-bot_application = None
-bot_loop = None
-bot_thread = None
-
-def run_async_in_thread(coro):
-    """Helper function to run async coroutines in the bot's event loop"""
-    if bot_loop is None:
-        raise RuntimeError("Bot event loop not initialized")
-    
-    future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
-    return future.result(timeout=30)  # 30 second timeout
-
-def init_bot():
-    """Initialize the bot application in a separate thread"""
-    global bot_application, bot_loop, bot_thread
-    
-    def bot_thread_func():
-        global bot_loop
-        # Create new event loop for this thread
-        bot_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(bot_loop)
-        
-        async def setup_bot():
-            global bot_application
-            
-            # Create and initialize the bot application
-            bot_application = Application.builder().token(TOKEN).build()
-            
-            # Add command handlers
-            bot_application.add_handler(CommandHandler("start", start))
-            bot_application.add_handler(CommandHandler("mychatid", my_chat_id))
-            
-            # Initialize the application
-            await bot_application.initialize()
-            logger.info("Bot application initialized successfully")
-            
-            # Set webhook if URL is provided
-            if WEBHOOK_URL:
-                full_webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
-                logger.info(f"Setting webhook to: {full_webhook_url}")
-                try:
-                    await bot_application.bot.set_webhook(url=full_webhook_url, drop_pending_updates=True)
-                    logger.info("Telegram webhook set successfully")
-                except Exception as e:
-                    logger.error(f"Failed to set webhook: {e}")
-            
-        # Run the setup and then keep the loop running
-        bot_loop.run_until_complete(setup_bot())
-        bot_loop.run_forever()
-    
-    # Start bot in separate thread
-    bot_thread = threading.Thread(target=bot_thread_func, daemon=True)
-    bot_thread.start()
-    
-    # Wait a moment for initialization
-    import time
-    time.sleep(2)
-    
-    if bot_application is None:
-        raise RuntimeError("Failed to initialize bot application")
-    
-    logger.info("Bot initialization completed")
+# Global bot instance
+bot = Bot(TOKEN)
+application = None
 
 # --- Telegram Command Handlers ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a message when the command /start is issued."""
     user = update.effective_user
@@ -116,72 +50,142 @@ async def my_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(response_message, parse_mode='Markdown')
     logger.info(f"User {user_name} ({chat_id}) requested chat ID.")
 
+def setup_application():
+    """Setup the telegram application"""
+    global application
+    
+    if application is None:
+        application = Application.builder().token(TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("mychatid", my_chat_id))
+        
+        logger.info("Application setup complete")
+    
+    return application
+
+def run_async(coro):
+    """Run async function in a new event loop"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(coro)
+        loop.close()
+        return result
+    except Exception as e:
+        logger.error(f"Error running async function: {e}")
+        raise
+
 # --- Flask Routes ---
+@app.route('/')
+def home():
+    """Simple home route"""
+    return jsonify({
+        "status": "Bot is running",
+        "webhook_url": f"{request.url_root}telegram-webhook" if request.url_root else "Not set"
+    })
 
 @app.route('/telegram-webhook', methods=['POST'])
 def telegram_webhook():
     """Handles incoming Telegram updates via webhook."""
-    if request.method == "POST":
-        if bot_application is None:
-            logger.error("Bot application not initialized")
-            return "Bot not ready", 500
-            
-        try:
-            update_json = request.get_json(force=True)
-            update = Update.de_json(update_json, bot_application.bot)
-            
-            # Process the update in the bot's event loop
-            run_async_in_thread(bot_application.process_update(update))
-            
-            logger.info("Received and processed update from Telegram")
-            return "ok"
-        except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
-            return "Error", 500
-    
-    return "<h1>Telegram Webhook Endpoint - Listening for POST requests</h1>", 200
+    try:
+        # Setup application if not already done
+        app_instance = setup_application()
+        
+        # Get update data
+        update_json = request.get_json(force=True)
+        if not update_json:
+            logger.error("No JSON data received")
+            return "No data", 400
+        
+        # Create update object
+        update = Update.de_json(update_json, bot)
+        if not update:
+            logger.error("Failed to parse update")
+            return "Invalid update", 400
+        
+        # Process the update
+        async def process_update():
+            await app_instance.initialize()
+            await app_instance.process_update(update)
+            await app_instance.shutdown()
+        
+        run_async(process_update())
+        
+        logger.info("Successfully processed update")
+        return "OK"
+        
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}", exc_info=True)
+        return "Error", 500
 
 @app.route('/send_telegram_notification', methods=['POST'])
 def send_telegram_notification():
-    """
-    API endpoint to send a Telegram message to a specified chat ID.
-    Requires 'chat_id' and 'message' in the JSON request body.
-    """
-    if bot_application is None:
-        return jsonify({"error": "Bot not ready"}), 500
-        
-    data = request.json
-    chat_id = data.get('chat_id')
-    message_text = data.get('message')
-
-    if not chat_id or not message_text:
-        return jsonify({"error": "Missing chat_id or message"}), 400
-
+    """Send a Telegram message to a specified chat ID."""
     try:
-        run_async_in_thread(
-            bot_application.bot.send_message(chat_id=chat_id, text=message_text)
-        )
+        data = request.json
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+            
+        chat_id = data.get('chat_id')
+        message_text = data.get('message')
+
+        if not chat_id or not message_text:
+            return jsonify({"error": "Missing chat_id or message"}), 400
+
+        # Send message
+        async def send_message():
+            await bot.send_message(chat_id=chat_id, text=message_text)
         
-        logger.info(f"Successfully sent Telegram message to {chat_id}")
+        run_async(send_message())
+        
+        logger.info(f"Successfully sent message to {chat_id}")
         return jsonify({"status": "Message sent"}), 200
+        
     except Exception as e:
-        logger.error(f"Error sending Telegram message to {chat_id}: {e}")
+        logger.error(f"Error sending message: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
+@app.route('/health')
+def health():
     """Health check endpoint"""
-    if bot_application is None:
-        return jsonify({"status": "Bot not ready"}), 500
-    return jsonify({"status": "OK", "bot_ready": True}), 200
+    return jsonify({"status": "healthy", "bot_token_set": bool(TOKEN)})
 
-# Initialize the bot when the module is imported
-try:
-    init_bot()
-except Exception as e:
-    logger.critical(f"Failed to initialize bot: {e}")
-    # Don't raise here, let Flask start but bot won't work
+@app.route('/set_webhook', methods=['POST'])
+def set_webhook():
+    """Manually set webhook"""
+    try:
+        if not WEBHOOK_URL:
+            return jsonify({"error": "WEBHOOK_URL not configured"}), 400
+            
+        webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
+        
+        async def set_wh():
+            await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        
+        run_async(set_wh())
+        
+        logger.info(f"Webhook set to: {webhook_url}")
+        return jsonify({"status": "Webhook set", "url": webhook_url})
+        
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+# Set webhook on startup if URL is provided
+if WEBHOOK_URL:
+    try:
+        webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
+        
+        async def startup_webhook():
+            await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            logger.info(f"Startup webhook set to: {webhook_url}")
+        
+        run_async(startup_webhook())
+    except Exception as e:
+        logger.error(f"Failed to set startup webhook: {e}")
 
 if __name__ == "__main__":
-    logger.info("Starting Flask API server for local development...")
-    app.run(host='0.0.0.0', port=os.getenv("PORT", 5000), debug=False)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
