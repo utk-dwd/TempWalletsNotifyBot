@@ -57,6 +57,13 @@ def setup_application():
     if application is None:
         application = Application.builder().token(TOKEN).build()
         
+        # Add error handler
+        async def error_handler(update: object, context) -> None:
+            """Log the error and send a telegram message to notify the developer."""
+            logger.error(f"Exception while handling an update: {context.error}")
+        
+        application.add_error_handler(error_handler)
+        
         # Add handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("mychatid", my_chat_id))
@@ -107,9 +114,11 @@ def telegram_webhook():
         
         # Process the update
         async def process_update():
+            await bot.initialize()  # Initialize bot first
             await app_instance.initialize()
             await app_instance.process_update(update)
             await app_instance.shutdown()
+            await bot.shutdown()  # Clean shutdown
         
         run_async(process_update())
         
@@ -162,7 +171,9 @@ def set_webhook():
         webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
         
         async def set_wh():
+            await bot.initialize()
             await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            await bot.shutdown()
         
         run_async(set_wh())
         
@@ -179,7 +190,9 @@ if WEBHOOK_URL:
         webhook_url = f"{WEBHOOK_URL}/telegram-webhook"
         
         async def startup_webhook():
+            await bot.initialize()
             await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            await bot.shutdown()
             logger.info(f"Startup webhook set to: {webhook_url}")
         
         run_async(startup_webhook())
